@@ -198,6 +198,12 @@ class SSHLocalForwarder(SSHForwarder):
         self._conn = conn
         self._coro = coro
 
+    def _forward_established(self) -> None:
+        """Handle successful establishment of the forwarded connection"""
+
+    def _forward_failed(self, exc: ChannelOpenError) -> None:
+        """Handle failure to establish the forwarded connection"""
+
     async def _forward(self, *args: object) -> None:
         """Begin local forwarding"""
 
@@ -209,6 +215,7 @@ class SSHLocalForwarder(SSHForwarder):
         try:
             await self._coro(session_factory, *args)
         except ChannelOpenError as exc:
+            self._forward_failed(exc)
             self.connection_lost(exc)
             return
 
@@ -217,6 +224,8 @@ class SSHLocalForwarder(SSHForwarder):
             return
 
         assert self._peer is not None
+
+        self._forward_established()
 
         if self._inpbuf:
             self._peer.write(self._inpbuf)

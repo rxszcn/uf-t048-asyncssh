@@ -23,7 +23,10 @@
 from ipaddress import ip_address
 from typing import TYPE_CHECKING, Callable, Optional
 
+from .constants import OPEN_ADMINISTRATIVELY_PROHIBITED
+from .constants import OPEN_CONNECT_FAILED, OPEN_RESOURCE_SHORTAGE
 from .forward import SSHForwarderCoro, SSHLocalForwarder
+from .misc import ChannelOpenError
 from .session import DataType
 
 
@@ -41,6 +44,7 @@ SOCKS5                  = 0x05
 SOCKS_CONNECT           = 0x01
 
 SOCKS4_OK               = 0x5a
+SOCKS4_FAILED           = 0x5b
 SOCKS5_OK               = 0x00
 
 SOCKS5_AUTH_NONE        = 0x00
@@ -49,10 +53,23 @@ SOCKS5_ADDR_IPV4        = 0x01
 SOCKS5_ADDR_HOSTNAME    = 0x03
 SOCKS5_ADDR_IPV6        = 0x04
 
+# SOCKSv5 reply codes
+SOCKS5_GENERAL_FAILURE  = 0x01
+SOCKS5_NOT_ALLOWED      = 0x02
+SOCKS5_CONN_REFUSED     = 0x05
+
 SOCKS4_OK_RESPONSE      = bytes((0, SOCKS4_OK, 0, 0, 0, 0, 0, 0))
+SOCKS4_FAILED_RESPONSE  = bytes((0, SOCKS4_FAILED, 0, 0, 0, 0, 0, 0))
 SOCKS5_OK_RESPONSE_HDR  = bytes((SOCKS5, SOCKS5_OK, 0))
 
 _socks5_addr_len = { SOCKS5_ADDR_IPV4: 4, SOCKS5_ADDR_IPV6: 16 }
+
+# Mapping from SSH channel open failure codes to SOCKSv5 reply codes
+_socks5_error_codes = {
+    OPEN_ADMINISTRATIVELY_PROHIBITED: SOCKS5_NOT_ALLOWED,
+    OPEN_CONNECT_FAILED:              SOCKS5_CONN_REFUSED,
+    OPEN_RESOURCE_SHORTAGE:           SOCKS5_GENERAL_FAILURE,
+}
 
 
 class SSHSOCKSForwarder(SSHLocalForwarder):
@@ -64,6 +81,7 @@ class SSHSOCKSForwarder(SSHLocalForwarder):
         self._inpbuf = b''
         self._bytes_needed = 2
         self._recv_handler: _RecvHandler = self._recv_version
+        self._version = 0
         self._addrtype = 0
         self._host = ''
         self._port = 0
@@ -79,14 +97,21 @@ class SSHSOCKSForwarder(SSHLocalForwarder):
         self.forward(self._host, self._port, orig_host, orig_port)
 
     def _send_socks4_ok(self) -> None:
-        """Send SOCKS4 success response"""
+        """Send SOCKSv4 success response"""
 
         assert self._transport is not None
 
         self._transport.write(SOCKS4_OK_RESPONSE)
 
+    def _send_socks4_failed(self) -> None:
+        """Send SOCKSv4 failure response"""
+
+        assert self._transport is not None
+
+        self._transport.write(SOCKS4_FAILED_RESPONSE)
+
     def _send_socks5_ok(self) -> None:
-        """Send SOCKS5 success response"""
+        """Send SOCKSv5 success response"""
 
         assert self._transport is not None
 
@@ -96,16 +121,45 @@ class SSHSOCKSForwarder(SSHLocalForwarder):
                               bytes((self._addrtype,)) +
                               addrlen * b'\0')
 
+    def _send_socks5_failed(self, code: int) -> None:
+        """Send SOCKSv5 failure response"""
+
+        assert self._transport is not None
+
+        addrlen = _socks5_addr_len[self._addrtype] + 2
+
+        self._transport.write(bytes((SOCKS5, code, 0, self._addrtype)) +
+                              addrlen * b'\0')
+
+    def _forward_established(self) -> None:
+        """Send the SOCKS success response once the tunnel is open"""
+
+        if self._version == SOCKS4:
+            self._send_socks4_ok()
+        else:
+            self._send_socks5_ok()
+
+    def _forward_failed(self, exc: ChannelOpenError) -> None:
+        """Send a SOCKS failure response when the tunnel can't be opened"""
+
+        if self._version == SOCKS4:
+            self._send_socks4_failed()
+        else:
+            code = _socks5_error_codes.get(exc.code, SOCKS5_GENERAL_FAILURE)
+            self._send_socks5_failed(code)
+
     def _recv_version(self, data: bytes) -> None:
         """Parse SOCKS version"""
 
         if data[0] == SOCKS4:
             if data[1] == SOCKS_CONNECT:
+                self._version = SOCKS4
                 self._bytes_needed = 6
                 self._recv_handler = self._recv_socks4_addr
             else:
                 self.close()
         elif data[0] == SOCKS5:
+            self._version = SOCKS5
             self._bytes_needed = data[1]
             self._recv_handler = self._recv_socks5_authlist
         else:
@@ -129,7 +183,6 @@ class SSHSOCKSForwarder(SSHLocalForwarder):
         # pylint: disable=unused-argument
 
         if self._host:
-            self._send_socks4_ok()
             self._connect()
         else:
             self._bytes_needed = -1
@@ -144,7 +197,6 @@ class SSHSOCKSForwarder(SSHLocalForwarder):
             self.close()
             return
 
-        self._send_socks4_ok()
         self._connect()
 
     def _recv_socks5_authlist(self, data: bytes) -> None:
@@ -210,7 +262,6 @@ class SSHSOCKSForwarder(SSHLocalForwarder):
         """Parse SOCKSv5 port"""
 
         self._port = (data[0] << 8) + data[1]
-        self._send_socks5_ok()
         self._connect()
 
     def data_received(self, data: bytes, datatype: DataType = None) -> None:

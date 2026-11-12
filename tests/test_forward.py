@@ -35,8 +35,9 @@ from asyncssh.forward import SSHLocalForwarder
 from asyncssh.misc import maybe_wait_closed, write_file
 from asyncssh.packet import String, UInt32
 from asyncssh.public_key import CERT_TYPE_USER
-from asyncssh.socks import SOCKS5, SOCKS5_AUTH_NONE
-from asyncssh.socks import SOCKS4_OK_RESPONSE, SOCKS5_OK_RESPONSE_HDR
+from asyncssh.socks import SOCKS4, SOCKS5, SOCKS5_AUTH_NONE
+from asyncssh.socks import SOCKS4_FAILED_RESPONSE, SOCKS4_OK_RESPONSE
+from asyncssh.socks import SOCKS5_CONN_REFUSED, SOCKS5_OK_RESPONSE_HDR
 
 from .server import Server, ServerTestCase
 from .util import asynctest, echo, make_certificate, try_remove
@@ -1400,12 +1401,14 @@ class _TestSOCKSForwarding(_CheckForwarding):
 
         writer.write(data)
 
-        response = await reader.readexactly(len(SOCKS4_OK_RESPONSE))
-        self.assertEqual(response, SOCKS4_OK_RESPONSE)
-
         if result:
+            response = await reader.readexactly(len(SOCKS4_OK_RESPONSE))
+            self.assertEqual(response, SOCKS4_OK_RESPONSE)
+
             await self._check_echo_line(reader, writer)
         else:
+            response = await reader.readexactly(len(SOCKS4_FAILED_RESPONSE))
+            self.assertEqual(response, SOCKS4_FAILED_RESPONSE)
             self.assertEqual((await reader.read()), b'')
 
     async def _check_socks5_connect(self, reader, writer, data,
@@ -1420,15 +1423,20 @@ class _TestSOCKSForwarding(_CheckForwarding):
         await asyncio.sleep(0.1)
         writer.write(data[20:])
 
-        expected = SOCKS5_OK_RESPONSE_HDR + bytes((addrtype,)) + \
-                   (addrlen + 2) * b'\0'
-
-        response = await reader.readexactly(len(expected))
-        self.assertEqual(response, expected)
-
         if result:
+            expected = SOCKS5_OK_RESPONSE_HDR + bytes((addrtype,)) + \
+                       (addrlen + 2) * b'\0'
+
+            response = await reader.readexactly(len(expected))
+            self.assertEqual(response, expected)
+
             await self._check_echo_line(reader, writer)
         else:
+            expected = bytes((SOCKS5, SOCKS5_CONN_REFUSED, 0, addrtype)) + \
+                       (addrlen + 2) * b'\0'
+
+            response = await reader.readexactly(len(expected))
+            self.assertEqual(response, expected)
             self.assertEqual((await reader.read()), b'')
 
     async def _check_socks(self, handler, listen_port, msg,
@@ -1498,6 +1506,95 @@ class _TestSOCKSForwarding(_CheckForwarding):
                     await self._check_socks(self._check_socks5_connect,
                                             listen_port, msg, data,
                                             addrtype, addrlen, result)
+
+    async def _check_socks4_connect_result(self, listen_port, dest_port,
+                                           reachable):
+        """Check SOCKSv4 success/failure reply ordering against reachability"""
+
+        reader, writer = await asyncio.open_connection('127.0.0.1',
+                                                       listen_port)
+
+        try:
+            # SOCKSv4 CONNECT request to 127.0.0.1:dest_port, empty user id
+            writer.write(bytes((SOCKS4, 1, (dest_port >> 8) & 0xff,
+                                dest_port & 0xff, 127, 0, 0, 1, 0)))
+
+            expected = SOCKS4_OK_RESPONSE if reachable else \
+                SOCKS4_FAILED_RESPONSE
+
+            # The reply must only arrive after the tunnel attempt completes
+            self.assertEqual(
+                await reader.readexactly(len(SOCKS4_OK_RESPONSE)),
+                expected)
+
+            if reachable:
+                await self._check_echo_line(reader, writer)
+            else:
+                self.assertEqual(await reader.read(), b'')
+        finally:
+            writer.close()
+            await maybe_wait_closed(writer)
+
+    async def _check_socks5_connect_result(self, listen_port, dest_port,
+                                           reachable):
+        """Check SOCKSv5 success/failure reply ordering against reachability"""
+
+        reader, writer = await asyncio.open_connection('127.0.0.1',
+                                                       listen_port)
+
+        try:
+            writer.write(bytes((SOCKS5, 1, SOCKS5_AUTH_NONE)))
+            self.assertEqual(await reader.readexactly(2),
+                             bytes((SOCKS5, SOCKS5_AUTH_NONE)))
+
+            # SOCKSv5 CONNECT request to 127.0.0.1:dest_port
+            writer.write(bytes((SOCKS5, 1, 0, 1, 127, 0, 0, 1,
+                                (dest_port >> 8) & 0xff,
+                                dest_port & 0xff)))
+
+            reply_len = 4 + 4 + 2
+
+            if reachable:
+                expected = SOCKS5_OK_RESPONSE_HDR + bytes((1,)) + 6 * b'\0'
+            else:
+                expected = bytes((SOCKS5, SOCKS5_CONN_REFUSED, 0, 1)) + \
+                           6 * b'\0'
+
+            # The reply must only arrive after the tunnel attempt completes
+            self.assertEqual(await reader.readexactly(reply_len), expected)
+
+            if reachable:
+                await self._check_echo_line(reader, writer)
+            else:
+                self.assertEqual(await reader.read(), b'')
+        finally:
+            writer.close()
+            await maybe_wait_closed(writer)
+
+    @asynctest
+    async def test_forward_socks_connect_results(self):
+        """Test SOCKS reply codes against reachable and unreachable targets"""
+
+        async with self.connect() as conn:
+            async with conn.forward_socks('', 0) as listener:
+                listen_port = listener.get_port()
+
+                # Port 7 is accepted by the test server, port 1 is rejected
+                with self.subTest(version='SOCKSv4', target='reachable'):
+                    await self._check_socks4_connect_result(
+                        listen_port, 7, True)
+
+                with self.subTest(version='SOCKSv4', target='unreachable'):
+                    await self._check_socks4_connect_result(
+                        listen_port, 1, False)
+
+                with self.subTest(version='SOCKSv5', target='reachable'):
+                    await self._check_socks5_connect_result(
+                        listen_port, 7, True)
+
+                with self.subTest(version='SOCKSv5', target='unreachable'):
+                    await self._check_socks5_connect_result(
+                        listen_port, 1, False)
 
     @asynctest
     async def test_forward_socks_specific_port(self):

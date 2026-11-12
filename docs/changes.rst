@@ -3,6 +3,16 @@
 Change Log
 ==========
 
+Release 2.24.2 (under development)
+----------------------------------
+
+* Fixed SOCKS dynamic port forwarding to delay the success reply until
+  after the tunneled connection is established. When the destination is
+  unreachable, a protocol-appropriate failure reply is now sent (SOCKSv4
+  failure code 0x5b or the matching SOCKSv5 reply code) before the
+  connection is closed, instead of reporting success and then silently
+  dropping the connection.
+
 Release 2.24.1 (3 Oct 2026)
 ---------------------------
 
